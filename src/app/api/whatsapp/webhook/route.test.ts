@@ -43,6 +43,10 @@ const h = vi.hoisted(() => ({
     broadcastRecipient: null as { id: string; status: string } | null,
     /** Patches applied to that broadcast_recipients row. */
     recipientUpdates: [] as Record<string, unknown>[],
+    /** Owner's private-contact numbers (migration 060). */
+    privateNumbers: [] as string[],
+    /** Patches applied to `conversations` via update().eq(). */
+    conversationUpdates: [] as Record<string, unknown>[],
   },
 }))
 
@@ -94,8 +98,13 @@ vi.mock('@supabase/supabase-js', () => ({
                 }),
               }),
             }),
-            update: () => ({
+            update: (patch: Record<string, unknown>) => ({
               eq: () => ({
+                // Echo handler awaits update().eq() directly.
+                then: (resolve: (v: unknown) => void) => {
+                  h.state.conversationUpdates.push(patch)
+                  resolve({ data: null, error: null })
+                },
                 is: () => ({
                   select: () => {
                     h.state.firstInboundClaims++
@@ -204,6 +213,16 @@ vi.mock('@supabase/supabase-js', () => ({
                   }),
               }
             },
+          }
+        case 'private_contacts':
+          return {
+            select: () => ({
+              eq: () =>
+                Promise.resolve({
+                  data: h.state.privateNumbers.map((phone) => ({ phone })),
+                  error: null,
+                }),
+            }),
           }
         default:
           throw new Error(`unexpected table: ${table}`)
@@ -381,6 +400,8 @@ beforeEach(() => {
   h.state.whatsappConfigLookups = []
   h.state.broadcastRecipient = null
   h.state.recipientUpdates = []
+  h.state.privateNumbers = []
+  h.state.conversationUpdates = []
   mockFindExistingContact.mockResolvedValue({
     id: 'contact-1',
     name: 'Ada',
@@ -1171,5 +1192,84 @@ describe('inbound webhook: first_inbound_message fires once', () => {
     h.state.messageUpsertResult = []
     await runWebhook()
     expect(h.state.firstInboundClaims).toBe(0)
+  })
+})
+
+describe('owner controls: private contacts + coexistence echoes (migration 060)', () => {
+  it('drops a message from a private number before anything is stored', async () => {
+    h.state.privateNumbers = ['15551230000']
+    await runWebhook()
+    expect(h.state.upsertCalls).toHaveLength(0)
+    expect(h.state.contactInserts).toHaveLength(0)
+    expect(mockFindExistingContact).not.toHaveBeenCalled()
+    expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
+  })
+
+  it('still processes non-private senders when a private list exists', async () => {
+    h.state.privateNumbers = ['263772000000']
+    await runWebhook()
+    expect(h.state.upsertCalls).toHaveLength(1)
+  })
+
+  async function runEcho(to: string) {
+    const body = {
+      entry: [
+        {
+          changes: [
+            {
+              field: 'smb_message_echoes',
+              value: {
+                metadata: { phone_number_id: 'pn-1' },
+                message_echoes: [
+                  {
+                    from: '263779236937',
+                    to,
+                    id: 'wamid.ECHO1',
+                    timestamp: '1700000100',
+                    type: 'text',
+                    text: { body: 'Hi from my phone' },
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    }
+    await POST(signedPost(JSON.stringify(body)))
+    for (const cb of h.state.afterCallbacks) await cb()
+  }
+
+  it('mirrors a phone-app reply as an agent message and pauses the AI', async () => {
+    await runEcho('15551230000')
+    expect(h.state.upsertCalls).toHaveLength(1)
+    expect(h.state.upsertCalls[0].row).toMatchObject({
+      sender_type: 'agent',
+      message_id: 'wamid.ECHO1',
+      content_text: 'Hi from my phone',
+      status: 'sent',
+    })
+    expect(h.state.rpcCalls.find((c) => c.name === 'bump_conversation_on_inbound')).toBeUndefined()
+    expect(h.state.conversationUpdates[0]).toMatchObject({ ai_autoreply_disabled: true })
+    expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
+  })
+
+  it('ignores a phone-app reply to a private contact', async () => {
+    h.state.privateNumbers = ['15551230000']
+    await runEcho('15551230000')
+    expect(h.state.upsertCalls).toHaveLength(0)
+    expect(h.state.conversationUpdates).toHaveLength(0)
+  })
+
+  it('does not import history or address-book sync events', async () => {
+    for (const field of ['history', 'smb_app_state_sync']) {
+      const body = {
+        entry: [{ changes: [{ field, value: { metadata: { phone_number_id: 'pn-1' } } }] }],
+      }
+      await POST(signedPost(JSON.stringify(body)))
+    }
+    for (const cb of h.state.afterCallbacks) await cb()
+    expect(h.state.upsertCalls).toHaveLength(0)
+    expect(h.state.contactInserts).toHaveLength(0)
   })
 })

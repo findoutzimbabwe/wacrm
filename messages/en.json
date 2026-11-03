@@ -1969,7 +1969,8 @@
       "deals": "Deals & currency",
       "inbox": "Inbox",
       "members": "Team members",
-      "api": "API keys"
+      "api": "API keys",
+      "owner": "Owner controls"
     },
     "groups": {
       "account": "Account",

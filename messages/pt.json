@@ -1969,7 +1969,8 @@
       "deals": "Negócios e moeda",
       "inbox": "Caixa de entrada",
       "members": "Membros da equipe",
-      "api": "Chaves de API"
+      "api": "Chaves de API",
+      "owner": "Owner controls"
     },
     "groups": {
       "account": "Conta",

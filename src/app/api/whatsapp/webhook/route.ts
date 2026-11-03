@@ -32,6 +32,7 @@ import {
   isTemplateWebhookField,
 } from '@/lib/whatsapp/template-webhook'
 import { applyMessageStatus } from '@/lib/whatsapp/message-status-sync'
+import { listPrivateNumbers, matchesPrivateNumber } from '@/lib/privacy/private-contacts'
 
 // The `after()` callback in POST runs within this route's max duration.
 // Inbound processing can fan out to per-media Meta verification calls, so
@@ -126,6 +127,13 @@ interface WhatsAppWebhookEntry {
         parent_user_id?: string
       }>
       messages?: WhatsAppMessage[]
+      /**
+       * `smb_message_echoes` (coexistence): messages the business sent
+       * from the WhatsApp Business app on the phone. Same shape as an
+       * inbound message, but `from` is the business and `to` is the
+       * customer.
+       */
+      message_echoes?: Array<WhatsAppMessage & { to?: string; to_user_id?: string }>
       statuses?: Array<{
         id: string
         status: string
@@ -329,6 +337,25 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
         continue
       }
 
+      // Coexistence: replies the owner sent from the WhatsApp Business
+      // app on their phone. Mirror them into the thread so the team sees
+      // the full conversation, and pause the AI for that chat.
+      if (change.field === 'smb_message_echoes') {
+        await handleMessageEchoes(change.value)
+        continue
+      }
+
+      // Coexistence onboarding sync events (old chat history, the phone's
+      // address book) and account notices. Deliberately NOT imported: the
+      // owner chose to keep old chats and personal contacts on the phone.
+      if (
+        change.field === 'history' ||
+        change.field === 'smb_app_state_sync' ||
+        change.field === 'account_update'
+      ) {
+        continue
+      }
+
       const value = change.value
 
       // Handle status updates
@@ -385,9 +412,19 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
 
       const decryptedAccessToken = decrypt(config.access_token)
 
+      // Owner's private contacts (family etc.): never stored, never
+      // answered by the AI, never visible to the team. Checked before
+      // ANY row is written for the sender.
+      const privateNumbers = await listPrivateNumbers(supabaseAdmin(), config.account_id)
+
       for (let i = 0; i < value.messages.length; i++) {
         const message = value.messages[i]
         const contact = value.contacts[i] || value.contacts[0]
+
+        const senderPhone = message.from ?? contact?.wa_id ?? ''
+        if (privateNumbers.length > 0 && matchesPrivateNumber(senderPhone, privateNumbers)) {
+          continue
+        }
 
         await processMessage(
           message,
@@ -407,6 +444,111 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
         )
       }
     }
+  }
+}
+
+/** Map a WhatsApp message type onto the messages.content_type CHECK list. */
+function toStoredContentType(type: string): string {
+  const allowed = new Set([
+    'text', 'image', 'document', 'audio', 'video',
+    'location', 'template', 'interactive',
+  ])
+  if (allowed.has(type)) return type
+  if (type === 'sticker') return 'image'
+  if (type === 'button') return 'interactive'
+  return 'text'
+}
+
+/**
+ * Coexistence `smb_message_echoes`: a reply the owner typed in the
+ * WhatsApp Business app on their phone. Stored as an agent message in
+ * the customer's thread (no unread bump), and the AI is paused on that
+ * thread because a human has stepped in. Private numbers are skipped.
+ */
+async function handleMessageEchoes(value: WhatsAppWebhookEntry['changes'][number]['value']) {
+  const echoes = value.message_echoes
+  const phoneNumberId = value.metadata?.phone_number_id
+  if (!echoes?.length || !phoneNumberId) return
+
+  const { data: configRows, error } = await supabaseAdmin()
+    .from('whatsapp_config')
+    .select('account_id, user_id, access_token, mirror_inbound_media')
+    .eq('phone_number_id', phoneNumberId)
+  if (error || !configRows || configRows.length !== 1) {
+    console.error('[webhook] echo: could not resolve a single config for', phoneNumberId, error)
+    return
+  }
+  const config = configRows[0]
+  const privateNumbers = await listPrivateNumbers(supabaseAdmin(), config.account_id)
+
+  let accessToken: string
+  try {
+    accessToken = decrypt(config.access_token)
+  } catch (err) {
+    console.error('[webhook] echo: cannot decrypt access token', err)
+    return
+  }
+
+  for (const echo of echoes) {
+    const customerPhone = echo.to ?? ''
+    if (privateNumbers.length > 0 && matchesPrivateNumber(customerPhone, privateNumbers)) continue
+    if (echo.type === 'reaction') continue
+
+    const identity = resolveInboundIdentity({ from: echo.to, from_user_id: echo.to_user_id }, undefined)
+    if (!hasUsableIdentity(identity)) continue
+
+    const contactOutcome = await findOrCreateContact(config.account_id, config.user_id, identity)
+    if (!contactOutcome) continue
+    const convResult = await findOrCreateConversation(
+      config.account_id,
+      config.user_id,
+      contactOutcome.contact.id,
+    )
+    if (!convResult) continue
+    const conversation = convResult.conversation
+
+    const { contentText, mediaUrl, mediaType } = await parseMessageContent(
+      echo,
+      accessToken,
+      config.mirror_inbound_media !== false ? { accountId: config.account_id } : null,
+    )
+
+    const sentAt = new Date(parseInt(echo.timestamp) * 1000).toISOString()
+    const { data: inserted, error: insErr } = await supabaseAdmin()
+      .from('messages')
+      .upsert(
+        {
+          conversation_id: conversation.id,
+          sender_type: 'agent',
+          sender_id: null,
+          content_type: toStoredContentType(echo.type),
+          content_text: contentText,
+          media_url: mediaUrl,
+          media_type: mediaType,
+          message_id: echo.id,
+          status: 'sent',
+          created_at: sentAt,
+        },
+        { onConflict: 'conversation_id,message_id', ignoreDuplicates: true },
+      )
+      .select('id')
+    if (insErr) {
+      console.error('[webhook] echo insert failed:', insErr)
+      continue
+    }
+    if (!inserted || inserted.length === 0) continue // replay
+
+    const { error: convErr } = await supabaseAdmin()
+      .from('conversations')
+      .update({
+        last_message_text: contentText || `[${echo.type}]`,
+        last_message_at: sentAt,
+        updated_at: new Date().toISOString(),
+        // The owner answered from the phone — let the human lead.
+        ai_autoreply_disabled: true,
+      })
+      .eq('id', conversation.id)
+    if (convErr) console.error('[webhook] echo conversation update failed:', convErr)
   }
 }
 

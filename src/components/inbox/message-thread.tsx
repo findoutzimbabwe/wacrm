@@ -3,6 +3,7 @@
 import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { useAuth } from "@/hooks/use-auth";
+import { DeleteChatButton } from "@/components/owner/delete-chat-button";
 import { usePresence } from "@/hooks/use-presence";
 import { PresenceDot } from "@/components/presence/presence-dot";
 import { presenceLabel } from "@/lib/presence";
@@ -1098,6 +1099,15 @@ export function MessageThread({
               />
             </button>
           )}
+
+          {/* Owner-only: permanently remove this chat from the CRM. */}
+          <DeleteChatButton
+            conversationId={conversation.id}
+            onDeleted={() => {
+              onRefresh?.();
+              onBack?.();
+            }}
+          />
 
           {/* Status dropdown */}
           <DropdownMenu>

@@ -19,6 +19,7 @@ import { DealsSettings } from '@/components/settings/deals-settings';
 import { InboxSettings } from '@/components/settings/inbox-settings';
 import { MembersTab } from '@/components/settings/members-tab';
 import { ApiKeysSettings } from '@/components/settings/api-keys-settings';
+import { OwnerControls } from '@/components/owner/owner-controls';
 import {
   resolveSection,
   type SettingsSection,
@@ -43,7 +44,7 @@ export default function SettingsPage() {
 function SettingsPageInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { defaultCurrency } = useAuth();
+  const { defaultCurrency, isOwner } = useAuth();
   const { mode } = useTheme();
   const t = useTranslations('Settings');
 
@@ -83,6 +84,7 @@ function SettingsPageInner() {
     deals: <DealsSettings />,
     members: <MembersTab />,
     api: <ApiKeysSettings />,
+    owner: <OwnerControls />,
   };
 
   return (
@@ -97,7 +99,12 @@ function SettingsPageInner() {
       </div>
 
       <div className="mt-6 grid gap-6 lg:grid-cols-[236px_minmax(0,1fr)] lg:items-start">
-        <SettingsRail active={section} onSelect={go} hints={hints} />
+        <SettingsRail
+          active={section}
+          onSelect={go}
+          hints={hints}
+          hidden={isOwner ? [] : ['owner']}
+        />
         <div className="min-w-0">{panel[section]}</div>
       </div>
     </div>
